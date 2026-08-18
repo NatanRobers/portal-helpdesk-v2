@@ -1,0 +1,132 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // True se o usuário logado tem um perfil de funcionário (users/{uid}.role
+    // existe e não é "pai"). Usado pelas regras do backoffice (/admin) —
+    // get()/exists() aqui dentro são leituras privilegiadas da própria engine
+    // de regras, não passam pela regra de `users/{userId}` abaixo.
+    function éFuncionario() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role != "pai";
+    }
+
+    // Perfil do responsável: cada um só lê/escreve o próprio documento.
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /chats/{chatId} {
+      // O responsável só acessa chats que ele mesmo abriu.
+      allow read: if request.auth != null
+        && resource.data.responsavelId == request.auth.uid;
+
+      allow create: if request.auth != null
+        && request.resource.data.responsavelId == request.auth.uid;
+
+      // Atualização (ex.: marcar escalonado) permitida apenas ao dono do chat.
+      // Em produção, a resposta da escola normalmente viria de um backend/admin
+      // com uma role própria — aqui simplificado para o escopo do MVP.
+      allow update: if request.auth != null
+        && resource.data.responsavelId == request.auth.uid;
+
+      match /messages/{messageId} {
+        allow read: if request.auth != null
+          && get(/databases/$(database)/documents/chats/$(chatId)).data.responsavelId == request.auth.uid;
+
+        allow create: if request.auth != null
+          && get(/databases/$(database)/documents/chats/$(chatId)).data.responsavelId == request.auth.uid;
+      }
+    }
+
+    match /tickets/{ticketId} {
+      // O solicitante acessa os próprios tickets; um funcionário acessa todos
+      // (fila de atendimento do backoffice).
+      allow read: if request.auth != null
+        && (resource.data.solicitanteId == request.auth.uid || éFuncionario());
+
+      allow create: if request.auth != null
+        && request.resource.data.solicitanteId == request.auth.uid;
+
+      // O solicitante só pode alterar `avaliacao` (CSAT) do próprio ticket.
+      // Um funcionário pode alterar `status` (select da fila de atendimento)
+      // OU `prioridade` (select de prioridade) — cada write só mexe num
+      // campo por vez, então cada ação da UI vira uma regra separada.
+      allow update: if request.auth != null
+        && (
+          (resource.data.solicitanteId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["avaliacao"]))
+          || (éFuncionario()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status"]))
+          || (éFuncionario()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["prioridade"]))
+        );
+
+      match /activities/{activityId} {
+        allow read, create: if request.auth != null
+          && (
+            get(/databases/$(database)/documents/tickets/$(ticketId)).data.solicitanteId == request.auth.uid
+            || éFuncionario()
+          );
+      }
+
+      // Chat bilateral do ticket. O responsável só lê/escreve nas mensagens
+      // do PRÓPRIO ticket; um funcionário lê/escreve nas mensagens de
+      // qualquer ticket (é o que dá acesso a /admin/tickets/[id]).
+      match /mensagens/{mensagemId} {
+        allow read, create: if request.auth != null
+          && (
+            get(/databases/$(database)/documents/tickets/$(ticketId)).data.solicitanteId == request.auth.uid
+            || éFuncionario()
+          );
+      }
+    }
+
+    // Contador usado pela transaction que gera o número sequencial do ticket
+    // (TICKET-1001, TICKET-1002...). Não guarda dado sensível — só um inteiro.
+    match /counters/{counterId} {
+      allow read, write: if request.auth != null;
+    }
+
+    match /agendamentos/{agendamentoId} {
+      // O solicitante acessa os próprios agendamentos; um funcionário acessa
+      // todos (a Agenda de Reuniões do backoffice filtra por setor no client
+      // pra UX, mas a regra em si libera a leitura pra qualquer funcionário
+      // — restringir por setor exigiria guardar o setor do funcionário no
+      // próprio `users/{uid}`, o que fica pra uma sprint futura).
+      allow read: if request.auth != null
+        && (resource.data.solicitanteId == request.auth.uid || éFuncionario());
+
+      allow create: if request.auth != null
+        && request.resource.data.solicitanteId == request.auth.uid;
+
+      // Responsável: só pode cancelar o próprio agendamento (status -> CANCELADO).
+      // Funcionário: pode alterar o status livremente (CONFIRMADO, CANCELADO ou
+      // REALIZADO) OU remarcar (data + horario juntos, numa escrita só) pela
+      // Agenda de Reuniões do backoffice — são duas ações da UI, então duas
+      // combinações de campos permitidas, nunca misturadas na mesma request.
+      allow update: if request.auth != null
+        && (
+          (resource.data.solicitanteId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status"])
+            && request.resource.data.status == "CANCELADO")
+          || (éFuncionario()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status"]))
+          || (éFuncionario()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["data", "horario"]))
+        );
+    }
+
+    // Configuração da agenda (dias/horários disponíveis). Leitura pública:
+    // até o pai (não-autenticado incluído, embora o app sempre exija login
+    // antes de qualquer tela) precisa ler isso pra montar o calendário do
+    // AgendamentoForm. Escrita restrita à escola.
+    match /configuracoes/{configId} {
+      allow read: if true;
+      allow write: if éFuncionario();
+    }
+  }
+}
